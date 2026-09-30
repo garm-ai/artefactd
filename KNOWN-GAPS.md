@@ -86,9 +86,14 @@ outliving a request, and it collapses the presigned read path. Nothing in this
 repository touches that repository, and `mise run no-enforcement` asserts there
 is not even a path in the dependency graph.
 
-**Not in any compose file.** This service is not added to the development plane.
-It has been run against the plane's SeaweedFS from a test, in its own bucket,
-which is what the round trip covers.
+**In the development plane, and reachable for reads only.** `garm-ai/stack`
+runs this service against the plane's SeaweedFS in its own bucket, and `describe`
+and `read_url` both answer there — `read_url` with `reason=delegated_reader` for
+an agent acting for a person. The WRITE path is a different matter: `begin_write`
+and `commit` require `VERB_WRITE` with the `artefacts` tool set, and no role that
+plane defines combines them, so the plane cannot yet put an object in the store.
+`TestTheWholeRoundTripAgainstARealObjectStore` is what covers the round trip, and
+until that plane grants the set it stays the only thing that does.
 
 ## Where a check is thinner than the design
 
