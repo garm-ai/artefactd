@@ -1,0 +1,484 @@
+// The artefact store: four governed calls over one S3 bucket, and not one
+// byte of an artefact on NATS.
+//
+// A tool that generates a document cannot return it. The daemon projects an
+// answer field by field against the caller's clearance and it cannot see
+// inside an .xlsx, so a spreadsheet is disclosed whole or not at all; and the
+// bytes cannot travel through a tool call either, because they would cross
+// the request bus everything else depends on. So a generated document gets a
+// store, and every question about that store is a governance question.
+//
+// THE SHAPE OF THIS CONTRACT IS THE ANSWER TO THREE OF THOSE QUESTIONS.
+//
+// 1. The write path is begin, upload, commit. `begin_write` hands back an id
+//    and a presigned PUT; the generator writes the bytes to S3 itself; then
+//    `commit` records the digest and the size. One service owns the key
+//    namespace, the tenancy prefix and the classification, and never handles
+//    a byte.
+//
+// 2. The model is given an id, never a URL. A presigned URL is a bearer
+//    credential — unlimited uses within its lifetime, from anywhere,
+//    recorded nowhere — so a generator returns an `artefact_id` and that is
+//    what goes in a model's context, in a card, and on a ledger row.
+//    Obtaining a URL is a separate governed call.
+//
+// 3. WHICH artefact a viewer may read is decided per artefact, not per
+//    method. So every method here is PUBLIC at the method gate and
+//    `read_url` carries what it releases inside a `garm.card.v1.Card`,
+//    labelled at that artefact's own classification. The daemon knows that
+//    one type and walks the VALUE at step 8: a viewer whose clearance and
+//    compartments do not reach the label gets the card cleared and therefore
+//    no URL and no key. A plain response field could not express this — a
+//    field policy is decided at compile time and the same field is readable
+//    by one viewer and not the next — which is the identical reason
+//    `garm.tasks.v1` puts a queue's rows in cards.
+//
+// No message here carries a `bytes` field that could hold a payload, and the
+// two that carry key material bound it and say why. That is asserted over
+// this service descriptor by internal/artefacts/contract_test.go rather than
+// left to be remembered: the way this rots is somebody adding a convenient
+// `fetch_artefact` because one caller found two round trips annoying.
+syntax = "proto3";
+
+package garm.artefacts.v1;
+
+import "buf/validate/validate.proto";
+import "garm/card/v1/card.proto";
+import "garm/meta/v1/meta.proto";
+import "garm/tool/v1/tool.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/garm-ai/artefactd/gen/garm/artefacts/v1;artefactsv1";
+
+// One set. A deployment grants `artefacts` to the roles that may name an
+// artefact at all; which of them may READ one is the card's answer, per
+// artefact, and never this set's.
+option (garm.tool.v1.tool_sets) = {
+  declared: [{
+    name: "artefacts"
+    description: "The artefact store: naming, describing and reading generated documents."
+  }]
+};
+
+// ---------------------------------------------------------------- vocabulary
+
+// State is where an artefact is in its life.
+//
+// SHREDDED is a state and not a deleted row, and that is the point of ruling
+// 6: erasure deletes the wrapped key while the record that the artefact
+// existed — and who was given access to it — survives. An audit trail must
+// keep the fact and lose the content.
+enum State {
+  STATE_UNSPECIFIED = 0;
+  // Named, with a presigned PUT outstanding and no bytes confirmed. Swept if
+  // it is never committed.
+  STATE_PENDING = 1;
+  // Committed: the bytes are there, the digest and the size are recorded.
+  STATE_COMMITTED = 2;
+  // The key is gone and the payload is unreadable. The row remains.
+  STATE_SHREDDED = 3;
+}
+
+// Classification is what the store stamped on an artefact, from the creating
+// run's principal.
+//
+// It is never a request field. The rule is the platform's own — the model
+// never sets a control field — and here it is enforced by the contract's
+// shape rather than by a check: no request message in this package has a
+// place to put one, which is asserted by the descriptor test.
+message Classification {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+  optional garm.tool.v1.Clearance clearance = 1;
+  repeated string compartments = 2 [(buf.validate.field).repeated = {
+    max_items: 16,
+    items: { string: { max_len: 64 } }
+  }];
+}
+
+// ---------------------------------------------------------------- begin_write
+
+message BeginWriteRequest {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+
+  // What the bytes will be. Recorded so a reader knows what it has and a
+  // card has something to show; it is the caller's assertion and the store
+  // does not sniff the payload, because it never sees it.
+  optional string media_type = 1 [
+      (buf.validate.field).required = true,
+      (buf.validate.field).string = { max_len: 255, pattern: "^[a-zA-Z0-9!#$&^_.+-]+/[a-zA-Z0-9!#$&^_.+-]+$" }];
+
+  // A human-facing name — a filename, a title — for a card and for a
+  // download. Never used to build a key: the key is the store's own, and a
+  // caller-supplied path component is how a store crosses a tenant.
+  optional string label = 2 [(buf.validate.field).string = { max_len: 255 }];
+
+  // The tool that is generating this artefact, as the catalogue names it.
+  // Provenance and an assertion of the caller's: the invocation names the
+  // principal, the run and the tenant, and does not name which tool is
+  // calling.
+  optional string tool_fqn = 3 [
+      (buf.validate.field).required = true,
+      (buf.validate.field).string = { max_len: 255 }];
+
+  // How long this artefact is worth keeping, in seconds, declared by the
+  // tool that creates it — a scratch preview says hours and a document about
+  // a payment says years. Ruling 5 puts the declaration on
+  // `garm.tool.v1.ToolPolicy`, which is a contracts release and not this
+  // repository's to make, so the value is carried here and where it comes
+  // from is left open. See KNOWN-GAPS.md.
+  optional uint32 retention_seconds = 4 [
+      (buf.validate.field).required = true,
+      (buf.validate.field).uint32 = { gte: 60, lte: 315360000 }];
+}
+
+message BeginWriteResponse {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+
+  // The id, and the only thing about this artefact that may travel onward.
+  optional string artefact_id = 1;
+
+  // A presigned PUT for exactly one object, at a key this service chose.
+  //
+  // It is a write credential and it is bounded by being a write credential:
+  // one object, at a key nobody else will be given, under this tenant's
+  // prefix, for minutes. It is here because ruling 2 says the generator
+  // writes the bytes itself — the alternative is the payload crossing NATS,
+  // which is what this whole design exists to avoid. `commit`, `describe`
+  // and every other response in this package carry no URL at all; the
+  // descriptor test names these two and refuses a third.
+  optional string upload_url = 2;
+
+  google.protobuf.Timestamp upload_expires_at = 3;
+
+  // The codec the writer must seal the payload with, by name. Recorded on
+  // the artefact so a future codec can still open an old object rather than
+  // the store being stuck on its first choice for ever.
+  optional string codec = 4 [(buf.validate.field).string = { max_len: 64 }];
+
+  // The data key for THIS artefact, in the clear, for the writer to seal
+  // with. Empty under the null codec, which is what a development plane
+  // runs.
+  //
+  // BOUNDED AND NOT A PAYLOAD: at most 32 bytes, which is one AES-256 key.
+  // It is one of the two `bytes` fields in this package and the descriptor
+  // test holds it to that bound — the rule the test enforces is that no
+  // message here can carry an artefact, and 32 bytes cannot.
+  optional bytes data_key = 5 [(buf.validate.field).bytes = { max_len: 32 }];
+}
+
+// ---------------------------------------------------------------- commit
+
+message CommitRequest {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+
+  optional string artefact_id = 1 [
+      (buf.validate.field).required = true,
+      (buf.validate.field).string = { len: 26 }];
+
+  // The digest of the PLAINTEXT, which is what a reader verifies after
+  // opening the payload. Distinct from stored_sha256 on purpose: S3 holds the
+  // ciphertext, and calling both of them `sha256` is how somebody later
+  // compares the wrong pair.
+  optional string plaintext_sha256 = 2 [(buf.validate.field).required = true,
+                               (buf.validate.field).string = { len: 64, pattern: "^[0-9a-f]{64}$" }];
+  optional uint64 plaintext_size_bytes = 3 [(buf.validate.field).required = true];
+
+  // The digest and the size of the object as the store holds it — the sealed
+  // payload. Under the null codec these equal the plaintext's; under any
+  // real codec they do not, and the size is what this service checks against
+  // what S3 says is there.
+  optional string stored_sha256 = 4 [(buf.validate.field).required = true,
+                            (buf.validate.field).string = { len: 64, pattern: "^[0-9a-f]{64}$" }];
+  optional uint64 stored_size_bytes = 5 [(buf.validate.field).required = true];
+}
+
+message CommitResponse {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+  optional string artefact_id = 1;
+  optional State state = 2;
+  google.protobuf.Timestamp committed_at = 3;
+  // When the retention this artefact declared runs out. The sweeper shreds
+  // it then: the key goes and the row stays.
+  google.protobuf.Timestamp retain_until = 4;
+}
+
+// ---------------------------------------------------------------- describe
+
+message DescribeRequest {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+  optional string artefact_id = 1 [
+      (buf.validate.field).required = true,
+      (buf.validate.field).string = { len: 26 }];
+}
+
+// DescribeResponse is everything about an artefact except the way in.
+//
+// It exists as a method of its own rather than as part of `read_url` for
+// three reasons. A card needs a label, a media type and a size to render,
+// and rendering discloses nothing. `read_url` writes a disclosure row and
+// mints a credential, so answering "does this exist and what is it" through
+// it would make the audit trail claim a disclosure that never happened. And
+// the model's legitimate question — is it there, what is it, how big — has an
+// answer that is safe to give it, which is this one.
+//
+// NEITHER KEY IS HERE. Not the wrapped key and not the data key, and not
+// masked by a field policy either: they are absent from the message. A field
+// policy is the daemon projecting what a caller may see, and a key that is
+// not in the response type cannot be leaked by a policy mistake. The
+// descriptor test asserts it.
+message DescribeResponse {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+
+  optional string artefact_id = 1;
+  optional State state = 2;
+  Classification classification = 3;
+
+  optional string media_type = 4;
+  optional string label = 5;
+  // The tool that created it and the run it was created in.
+  optional string tool_fqn = 6;
+  optional string run_id = 7;
+
+  // The plaintext's digest and size — what a reader verifies once it has
+  // opened the payload.
+  optional string plaintext_sha256 = 8;
+  optional uint64 plaintext_size_bytes = 9;
+  // What the object store holds, which is the sealed payload.
+  optional uint64 stored_size_bytes = 10;
+  // The codec the payload was sealed with, by name.
+  optional string codec = 11;
+
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp committed_at = 13;
+  google.protobuf.Timestamp retain_until = 14;
+  // Set when the key was destroyed. The row is still here; the content is
+  // not, and never will be again.
+  google.protobuf.Timestamp shredded_at = 15;
+}
+
+// ---------------------------------------------------------------- read_url
+
+message ReadUrlRequest {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+  optional string artefact_id = 1 [
+      (buf.validate.field).required = true,
+      (buf.validate.field).string = { len: 26 }];
+}
+
+// ReadUrlResponse is an id and a card, and the card is where the credential
+// is.
+//
+// The URL, its expiry and the data key are facts of a `garm.card.v1.Card`
+// labelled at the artefact's own classification, because that is the one
+// place in this platform where policy travels on the VALUE. The daemon walks
+// it at step 8 and clears the whole card for a viewer who does not reach the
+// label, so a caller below an artefact's clearance receives an id back and
+// nothing else. Putting the URL in a plain field would give it a policy
+// decided at compile time — one answer for every caller and every artefact —
+// which is exactly what ruling 4 forbids.
+message ReadUrlResponse {
+  option (garm.tool.v1.default_field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  };
+
+  // Echoed so a caller whose card was withheld knows which artefact it asked
+  // about. It is the id it already had.
+  optional string artefact_id = 1;
+
+  // What was released, or absent. The facts are `url`, `expires_at`,
+  // `codec`, `plaintext_sha256` and, under a real codec, `data_key` as
+  // base64 — one governed act releasing exactly one artefact's key.
+  //
+  // INTERNAL rather than PUBLIC as the field's own policy: the per-artefact
+  // answer is the card's `access` label, and this is the floor beneath it.
+  // An element labelled BELOW an endpoint's own policy fails the whole card,
+  // so the service raises every label to this floor and never below it.
+  garm.card.v1.Card release = 2 [(garm.tool.v1.field_policy) = {
+    read: CLEARANCE_PUBLIC
+    on_deny: { omit: {} }
+  }];
+}
+
+// ---------------------------------------------------------------- service
+
+service ArtefactsService {
+  option (garm.meta.v1.owner) = { team: "agent-platform" contact: "#agent-platform" };
+
+  // Name an artefact and hand back somewhere to put it.
+  //
+  // AUDIENCE_RUNNER: this is not a tool a model or a person is offered. A
+  // generator tool service calls it while executing a run, and the
+  // classification, the tenant prefix and the key are the store's, stamped
+  // from the invocation.
+  //
+  // An audience is a LISTING rule and not a gate — the daemon's own
+  // visibility check reads verbs, clearance, compartments and sets, and
+  // never the audience — so what actually keeps a model out of the read path
+  // is the check in the service and the card's label, not this line. It is
+  // here because being unlisted is worth having as well.
+  rpc BeginWrite(BeginWriteRequest) returns (BeginWriteResponse) {
+    option (garm.tool.v1.tool) = {
+      name: "begin_write"
+      title: "Begin writing an artefact"
+      description: "Name a new artefact and return its id and a presigned PUT for its bytes. "
+                   "The store chooses the key, stamps the tenant and the classification, "
+                   "and never handles the payload."
+      verb: VERB_WRITE
+      min_clearance: CLEARANCE_PUBLIC
+      audience: [AUDIENCE_RUNNER]
+      sets: ["artefacts"]
+      approval: { mode: MODE_NONE }
+      // Not idempotent: each call names a NEW artefact. A retry after a
+      // timeout leaves an uncommitted row, which the sweeper removes.
+      effects: { idempotent: false reversibility: REVERSIBILITY_FULL }
+      audit: { level: LEVEL_LEDGER }
+      guidance: {
+        when_to_use: "Before writing a generated document, to get somewhere to put it."
+        when_not_to_use: "Never to obtain a URL for reading. That is read_url, and it is a "
+                         "separate governed call for a reason."
+      }
+    };
+  }
+
+  // Record that the bytes are there.
+  //
+  // The store checks with S3 that an object of the size claimed exists at
+  // the key it named, which is as far as it can check without reading a
+  // payload it must never read.
+  rpc Commit(CommitRequest) returns (CommitResponse) {
+    option (garm.tool.v1.tool) = {
+      name: "commit"
+      title: "Commit an artefact"
+      description: "Record the digest and the size of an artefact whose bytes have been "
+                   "written, making it readable."
+      verb: VERB_WRITE
+      min_clearance: CLEARANCE_PUBLIC
+      audience: [AUDIENCE_RUNNER]
+      sets: ["artefacts"]
+      approval: { mode: MODE_NONE }
+      // Committing the same artefact twice with the same digest is the same
+      // commit. A different digest is a refusal.
+      effects: { idempotent: true reversibility: REVERSIBILITY_NONE }
+      audit: { level: LEVEL_LEDGER }
+      guidance: {
+        when_to_use: "Immediately after the presigned PUT succeeds."
+        on_error: "An uncommitted artefact is swept. Begin again rather than reusing the id."
+      }
+    };
+  }
+
+  // What an artefact is, without the way in.
+  //
+  // Safe for a model: no URL, no key, and a response type that has nowhere
+  // to put either.
+  rpc Describe(DescribeRequest) returns (DescribeResponse) {
+    option (garm.tool.v1.tool) = {
+      name: "describe"
+      title: "Describe an artefact"
+      description: "The type, the size, the label, the classification and the state of one "
+                   "artefact. Never a URL and never a key."
+      verb: VERB_READ
+      min_clearance: CLEARANCE_PUBLIC
+      audience: [AUDIENCE_PERSON, AUDIENCE_AGENT]
+      sets: ["artefacts"]
+      approval: { mode: MODE_NONE }
+      effects: { idempotent: true reversibility: REVERSIBILITY_FULL }
+      audit: { level: LEVEL_LEDGER }
+      guidance: {
+        when_to_use: "To tell a person what you produced, or to check that a document you "
+                     "were handed an id for is the type and size you expected."
+        when_not_to_use: "Not to read the contents. You cannot, and this is not the call "
+                         "that would."
+      }
+    };
+  }
+
+  // Mint a short-lived URL for one artefact, and release its key.
+  //
+  // A PERSON, and the refusal that holds it is a CHECK and not the audience:
+  // the service refuses a call arriving with a delegation chain, which is
+  // what every call made by or for an agent carries. The same shape as
+  // `garm.tasks.v1.decide_task`, and for the same reason — a credential
+  // travelling towards a model is the mirror image of an approval given
+  // through one.
+  //
+  // WHICH artefacts this caller may actually read is not decided here at
+  // all. The card carries the artefact's classification as its label and the
+  // daemon drops what the viewer does not reach, so a method-level clearance
+  // would be the lowest one any artefact in the deployment carries, which is
+  // no gate.
+  //
+  // Every mint writes a disclosure row before the URL exists. A row that
+  // cannot be written is a URL that is not minted: that is the whole reason
+  // this is a governed call rather than a library function.
+  rpc ReadUrl(ReadUrlRequest) returns (ReadUrlResponse) {
+    option (garm.tool.v1.tool) = {
+      name: "read_url"
+      title: "Read an artefact"
+      description: "Mint a short-lived URL for one artefact, for a person, after checking "
+                   "that person reaches its classification. Recorded as a disclosure."
+      verb: VERB_READ
+      min_clearance: CLEARANCE_PUBLIC
+      audience: [AUDIENCE_PERSON]
+      sets: ["artefacts"]
+      approval: { mode: MODE_NONE }
+      // Reading changes nothing about the artefact. It does hand out a
+      // credential, which is why it is audited rather than merely logged.
+      effects: { idempotent: false reversibility: REVERSIBILITY_FULL }
+      // LEVEL_AUDIT and fail_closed, which together say that a disclosure
+      // this deployment cannot record is a disclosure it does not make. A
+      // LEVEL_AUDIT tool will not mount at all without an audit sink, and that
+      // is the point rather than an inconvenience.
+      //
+      // 2555 days is seven years, the same number garm.tasks.v1.decide_task
+      // and the bank's own payment tool declare — taken from them rather than
+      // chosen here, because a deployment has to provision ONE audit retention
+      // and three tools asking for three numbers is three deployments.
+      //
+      // record_request and record_response are both false. Not because the
+      // request is sensitive — it is an artefact id — but because a ledger
+      // Event carries no payload to put them in, so declaring them refuses to
+      // mount. What a disclosure needs recorded is in this service's own
+      // `disclosures` table, which is written before the URL exists.
+      audit: {
+        level: LEVEL_AUDIT
+        record_request: false
+        record_response: false
+        retain_days: 2555
+        fail_closed: true
+      }
+      guidance: {
+        when_to_use: "When a person needs the document itself."
+        when_not_to_use: "Never on behalf of a model, and never to pass a URL onward. The "
+                         "call is refused for a delegated caller."
+        on_error: "A refusal means this caller may not read this artefact, that it was "
+                  "never committed, or that its key has been destroyed. Do not retry."
+      }
+    };
+  }
+}

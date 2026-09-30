@@ -1,0 +1,14 @@
+// Typed, machine-readable error info attached as a connect error detail
+// (spec §8): SDKs map on `code`, never on message text.
+syntax = "proto3";
+
+package garm.tool.v1;
+
+option go_package = "github.com/garm-ai/contracts/garm/tool/v1;toolv1";
+
+message ErrorInfo {
+  // One of: unknown_alias | prompt_hash_mismatch | invalid_request |
+  // rate_limited | provider_unavailable | policy_violation (G1).
+  string code = 1;
+  int64 retry_after_ms = 2; // set when code == rate_limited and known
+}

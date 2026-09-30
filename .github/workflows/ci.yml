@@ -1,0 +1,62 @@
+# CI for artefactd.
+#
+# One job. The store and wire tests need a real Postgres, so the workflow brings
+# one up as a service container and hands its DSN to the tests — a fake would be
+# testing the fake, and the failures worth catching here are constraint
+# violations and the behaviour of an update that matches no rows.
+#
+# There is no object store. The round trip against a real S3 skips without
+# ARTEFACT_S3_ENDPOINT and is run deliberately rather than here: a test that
+# quietly passed because it skipped would be worse than one somebody runs on
+# purpose. What CI does cover of the object store is `internal/blob`'s key
+# construction, which is where the failure that could cross a tenant lives, and
+# the service's own behaviour against a double.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: artefactd
+          POSTGRES_PASSWORD: artefactd
+          POSTGRES_DB: artefactd
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U artefactd"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_DSN: postgres://artefactd:artefactd@127.0.0.1:5432/artefactd?sslmode=disable
+    steps:
+      # fetch-depth 0 because `gen-check` compares the working tree with what is
+      # committed, and a shallow clone has the tree without the history to
+      # compare it against.
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 }
+      - uses: jdx/mise-action@v2
+        with: { install: true, cache: true }
+      # Formatting, vet, build, the tests with a real Postgres, tidiness of
+      # go.mod, the vendored annotations against the contract version go.mod
+      # names, buf lint, garm lint, a catalogue that mounts on a garmd, the
+      # committed generated code against the proto and the migrations, and the
+      # three boundary checks: no path to the daemon or to a token minter, no
+      # path back to `github.com/garm-ai/garm` — the module the contracts left,
+      # which registers the same descriptor files and so makes a binary that
+      # builds and then panics at init — and no replace directive.
+      - run: mise run ci

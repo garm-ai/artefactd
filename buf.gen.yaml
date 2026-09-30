@@ -1,0 +1,26 @@
+# Generated Go is COMMITTED, because a Go module has to build from its own
+# source: a consumer runs `go build`, not buf plus two plugins. The cost of
+# committing is drift, and `mise run gen-check` is what pays it.
+#
+# `inputs: proto` and nothing else: the vendored annotations under
+# third_party are imported and never generated. Their Go lives in
+# github.com/garm-ai/contracts, and a second copy would register the same
+# descriptor file paths and panic in protoregistry at init — a binary that
+# builds and then does not start.
+version: v2
+inputs:
+  - directory: proto
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.12
+    out: gen
+    opt: paths=source_relative
+    include_imports: false
+  # The tool-side binding: one endpoint per tool, the cards each tool serves,
+  # and the descriptor hash the daemon compares with its catalogue. No connect
+  # plugin — this service is reached over NATS by a daemon that never speaks
+  # connect to it.
+  #
+  # contract_version stamps what the service advertises; bump it with the tag.
+  - local: protoc-gen-garm-go
+    out: gen
+    opt: paths=source_relative,emit=toolsdk,contract_version=v0.1.0

@@ -1,0 +1,6 @@
+# Build output. Nothing here is committed: the binary is built by `go build`
+# and installed by `go install`.
+/artefactd
+/dist/
+# The assembled proto tree and the catalogue built from it, both derived.
+/build/

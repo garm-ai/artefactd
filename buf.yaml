@@ -1,0 +1,31 @@
+# One workspace, two modules: this contract, and the garm annotations it
+# imports.
+#
+# The annotations are vendored — `garm init` writes them verbatim out of
+# github.com/garm-ai/contracts — and they are a module of their own so they
+# are imported by their real path while staying OUT of what is generated.
+# Go for them already exists in that module, and a second copy registering
+# the same descriptor file paths panics at init. `mise run vendor-check`
+# compares the vendored tree byte for byte against the release go.mod
+# requires.
+version: v2
+modules:
+  - path: proto
+  - path: third_party/proto
+    lint:
+      use: [BASIC]
+deps:
+  # Field constraints. The daemon evaluates these in the chain, before the
+  # resolver, so a request that can never succeed costs no hop.
+  - buf.build/bufbuild/protovalidate
+lint:
+  use: [STANDARD]
+  except:
+    # garm.card.v1's enum values are deliberately unprefixed, because a card
+    # crosses the wire as protojson and the JSON shape is the contract with
+    # the renderer. This contract references that type; the rule fires on the
+    # vendored file and on nothing of ours.
+    - ENUM_VALUE_PREFIX
+    - ENUM_ZERO_VALUE_SUFFIX
+breaking:
+  use: [FILE]

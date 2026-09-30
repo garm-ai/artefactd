@@ -1,0 +1,23 @@
+// Ownership: who is answerable for a tool service or an agent, shown on every
+// card built from it.
+//
+// Metadata, not policy, so it lives beside the card annotations rather than
+// inside garm.tool.v1. garmd stays blind to it: garm.meta.v1 is a namespace
+// the catalogue's version check ignores, like garm.agent.v1 and garm.card.v1.
+// agentd reads it from the catalogue generation a task or run pinned; ListTools
+// does not carry it. The extension numbers are outside every block the other
+// garm vocabularies own.
+syntax = "proto3";
+package garm.meta.v1;
+option go_package = "github.com/garm-ai/contracts/garm/meta/v1;metav1";
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.ServiceOptions { Owner owner = 50301; }          // a tool service or an agent service
+extend google.protobuf.MethodOptions  { Owner method_owner = 50302; }   // rare: one method owned elsewhere
+
+message Owner {
+  string team    = 1;   // stable identifier, lower-case kebab: "payments-platform"; the unit a ledger row is charged to
+  string contact = 2;   // where a person reaches the team: a mailbox or a channel name, free text
+  string on_call = 3;   // optional: the rota or escalation name for a stuck approval
+}

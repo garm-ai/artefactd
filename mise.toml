@@ -1,0 +1,310 @@
+# Toolchain and tasks for artefactd. `mise install` gets you a working checkout;
+# `mise run ci` is exactly what CI runs.
+#
+# Task names match every other garm-ai repository on purpose: `mise run test`
+# means the same thing everywhere, so moving between them costs no relearning.
+
+[tools]
+go = "1.26"
+buf = "1"
+sqlc = "1"
+
+[tasks.cli]
+description = "Install the garm CLI at the pinned version"
+# Pinned, not @latest: the catalogue digest must not move because someone
+# upgraded a CLI on a laptop.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.19.0"
+
+[tasks.plugin]
+description = "Install the tool generator at the pinned version"
+# The generated binding carries a descriptor hash; a generator that moved under
+# you changes committed output for no reason anyone asked for. It must be the
+# same release as the CLI: one writes the catalogue, the other writes the
+# binding whose hash the catalogue is checked against.
+run = "go install github.com/garm-ai/garm/cmd/protoc-gen-garm-go@v0.19.0"
+
+[tasks.daemon]
+description = "Install garmd at the pinned version, for the mount check"
+run = "go install github.com/garm-ai/garmd/cmd/garmd@v0.3.2"
+
+[tasks.build]
+description = "Build every package"
+run = "go build ./..."
+
+[tasks.test]
+description = "Run the tests"
+# -timeout because Go's default is ten minutes, and a test waiting on a
+# Postgres, a broker or an object store that never answers will sit there for
+# all of it.
+#
+# The race detector runs over everything, the wire-level suite included. It
+# could not before tool-go v0.6.0: a handler ran in a goroutine of its own
+# while nats.go's micro read that request after the handler returned, so any
+# tool service answering a coded refusal tripped the detector inside two
+# libraries. Handling is synchronous now and there is nothing to exempt.
+run = "go test ./... -race -count=1 -timeout 300s"
+
+[tasks.lint]
+description = "Vet the Go"
+run = "go vet ./..."
+
+[tasks.fmt]
+description = "Format"
+run = "go fmt ./..."
+
+[tasks."fmt-check"]
+description = "Fail if anything is unformatted"
+run = """
+out=$(gofmt -l ./cmd ./internal .)
+if [ -n "$out" ]; then
+  echo "unformatted — run 'mise run fmt':" >&2
+  echo "$out" >&2
+  exit 1
+fi
+"""
+
+[tasks."tidy-check"]
+description = "Fail if go.mod or go.sum is not tidy"
+run = """
+go mod tidy -diff || { echo "not tidy: run 'go mod tidy'" >&2; exit 1; }
+echo "ok: go.mod and go.sum are tidy"
+"""
+
+[tasks.pg]
+description = "A throwaway Postgres for the store and wire tests"
+# The tests read POSTGRES_DSN and skip when it is unset. This is the one
+# command that makes them run locally. Its own container and its own port: the
+# development plane's Postgres belongs to the plane, and a test suite that
+# creates and drops schemas in it is a suite that can spoil a demo.
+run = """
+docker rm -f artefactd-pg >/dev/null 2>&1 || true
+docker run -d --name artefactd-pg -e POSTGRES_PASSWORD=artefactd -e POSTGRES_USER=artefactd \\
+  -e POSTGRES_DB=artefactd -p 5441:5432 postgres:17-alpine >/dev/null
+echo 'export POSTGRES_DSN=postgres://artefactd:artefactd@127.0.0.1:5441/artefactd?sslmode=disable'
+"""
+
+[tasks.s3]
+description = "Print the environment for the round trip against the plane's SeaweedFS"
+# The round trip skips without these. It is NOT part of `ci`: it needs an
+# object store that CI does not have, and a test that quietly passed because it
+# skipped would be worse than one that is run deliberately.
+#
+# Its own bucket, because the plane's `garm` bucket holds the catalogue. The
+# test creates the bucket if it is missing and removes every object it wrote.
+run = """
+echo 'export ARTEFACT_S3_ENDPOINT=http://127.0.0.1:${GARM_E2E_S3_PORT:-8333}'
+echo 'export ARTEFACT_BUCKET=artefactd-dev'
+echo 'export AWS_ACCESS_KEY_ID=garmdev AWS_SECRET_ACCESS_KEY=garmdevsecret AWS_REGION=us-east-1'
+"""
+
+[tasks.gen]
+description = "Regenerate Go from the proto and SQL from the queries"
+depends = ["plugin"]
+run = ["buf generate", "sqlc generate"]
+
+[tasks."gen-check"]
+description = "Fail if the committed generated code is stale"
+# Generated code is COMMITTED, because a Go module has to build from its own
+# source: a consumer runs `go build`, not buf plus two plugins plus sqlc. The
+# cost of committing is drift, and this is the check that pays it. A generated
+# file that exists but was never added is stale in the same way, so the
+# untracked check is there beside the diff.
+#
+# It covers BOTH generators, and the sqlc half is the interesting one: sqlc
+# generates against the schema the migrations produce, so a query and a
+# migration that disagree fail HERE rather than in front of a person.
+#
+# wait_for, not depends: mise runs a task's dependencies in parallel, and
+# `buf generate` rewriting a .pb.go while `go build` reads it is a flaky red.
+wait_for = ["build", "test", "lint"]
+run = """
+mise run gen
+if ! git diff --quiet -- gen internal/store/sqlcgen; then
+  echo "generated code is stale — run 'mise run gen' and commit:" >&2
+  git diff --stat -- gen internal/store/sqlcgen >&2
+  exit 1
+fi
+if [ -n "$(git ls-files --others --exclude-standard -- gen internal/store/sqlcgen)" ]; then
+  echo "generated code is untracked — run 'git add' on:" >&2
+  git ls-files --others --exclude-standard -- gen internal/store/sqlcgen >&2
+  exit 1
+fi
+echo "ok: the committed generated code matches the proto and the migrations"
+"""
+
+[tasks."buf-lint"]
+description = "buf lint over the contract"
+run = "buf lint"
+
+[tasks."vendor-check"]
+description = "Fail if the vendored garm annotations differ from the contract version go.mod requires"
+# `garm init` writes the annotations verbatim out of github.com/garm-ai/contracts,
+# so drift is a byte comparison.
+#
+# The version is READ from go.mod, not written here. A constant in this file
+# only ever checks the tree against itself, which is how the same vendored
+# copies in a sibling repository sat five releases behind the module they
+# compiled against without one red run.
+run = """
+set -e
+V=$(awk '$1 == "github.com/garm-ai/contracts" {print $2}' go.mod)
+if [ -z "$V" ]; then
+  echo "go.mod does not require github.com/garm-ai/contracts; nothing vendored here can be checked" >&2
+  exit 1
+fi
+go mod download github.com/garm-ai/contracts@$V
+SRC="$(go env GOMODCACHE)/github.com/garm-ai/contracts@$V/proto"
+# Every file that is actually vendored, rather than a list repeated here: a
+# file added to third_party and left out of this task is the same drift by
+# another route.
+for f in $(find third_party/proto -name '*.proto' | sort); do
+  rel="${f#third_party/proto/}"
+  if [ ! -f "$SRC/$rel" ]; then
+    echo "third_party/proto/$rel is not a file contracts $V publishes" >&2
+    exit 1
+  fi
+  if ! cmp -s "$SRC/$rel" "$f"; then
+    echo "third_party/proto/$rel differs from contracts $V; copy the file from the module" >&2
+    exit 1
+  fi
+done
+echo "ok: the vendored annotations match contracts $V"
+"""
+
+[tasks."proto-lint"]
+description = "garm lint over the contract, with the vendored annotations joined in"
+# garm lint takes ONE proto root and resolves imports from it, so the two trees
+# are joined the way a catalogue build sees them.
+depends = ["cli", "assemble"]
+run = "garm lint --proto build/proto"
+
+[tasks.assemble]
+description = "Copy the contract and the vendored annotations into build/proto"
+run = """
+set -e
+rm -rf build/proto && mkdir -p build/proto
+cp -R third_party/proto/. build/proto/
+cp -R proto/. build/proto/
+echo "assembled build/proto:"
+find build/proto -type f | sort
+"""
+
+[tasks.catalogue]
+description = "Build the artefacts catalogue from the assembled tree"
+depends = ["cli", "assemble"]
+run = "garm catalogue build --proto build/proto -o build/artefacts.binpb --source garm-ai/artefactd"
+
+[tasks.check]
+description = "Assert the catalogue mounts on a daemon"
+# read_url declares audit LEVEL_AUDIT with fail_closed, and a catalogue that
+# does will NOT mount without an audit sink — which is the point rather than an
+# inconvenience: a deployment that cannot record a disclosure does not get to
+# make one. So the target deployment named here HAS one, at the retention the
+# contract asks for.
+#
+# 61320h is 2555 days, which is the number read_url declares and the same one
+# the bank example's own check passes. If the two ever disagree this task goes
+# red, which is the drift worth catching: a tool asking for a retention no
+# deployment provisions is a tool that mounts nowhere.
+depends = ["catalogue", "daemon"]
+run = "garmd check --catalogue build/artefacts.binpb --audit-retention 61320h"
+
+[tasks."no-enforcement"]
+description = "Fail if this service can reach the daemon or a token minter"
+# A tool service must not be able to enforce, and must not be able to mint an
+# identity: either one in this dependency graph means something in a request
+# path could decide what it is only supposed to be told. That matters more here
+# than in most services — this one holds key material — and the assignment is
+# on its own line because a `go list` that fails inside an `if` reads as a
+# clean check.
+run = """
+deps=$(go list -deps -test ./...)
+if [ -z "$deps" ]; then
+  echo "go list produced no output at all; that is a broken check, not a clean one" >&2
+  exit 1
+fi
+if echo "$deps" | grep -qE 'garm-ai/(garmd|sts|devkit)'; then
+  echo "artefactd reaches the daemon or a token minter:" >&2
+  echo "$deps" | grep -E 'garm-ai/(garmd|sts|devkit)' >&2
+  exit 1
+fi
+echo "ok: no path to the daemon or to a token minter"
+"""
+
+[tasks."no-old-contracts"]
+description = "Fail if the module the contracts left is in the build graph"
+# Not a dependency policy, and nothing is gained by granting it an exception:
+# `github.com/garm-ai/garm` and `github.com/garm-ai/contracts` register the
+# SAME protobuf descriptor file paths, so a binary linking both dies in
+# `protoregistry` at init. It compiles cleanly and then does not start, which
+# is exactly why this is a check rather than a note — `go build` is green
+# either way and only running the binary tells you.
+#
+# Anchored on the module path. `github.com/garm-ai/garm` and its packages must
+# fail; `github.com/garm-ai/garmd` must not, and neither must a future
+# `github.com/garm-ai/garm-anything`.
+#
+# The graph is read twice, because one `go list` is not the whole build:
+# `./...` is what ships, and `-test ./...` adds the test-only imports, where a
+# duplicate registration is just as fatal — it panics in package init, so
+# `go test` never reaches a test function.
+run = """
+found=0
+for graph in "./..." "-test ./..."; do
+  deps=$(go list -deps $graph) || exit 1
+  if [ -z "$deps" ]; then
+    echo "go list -deps $graph printed nothing; that is a broken check, not a clean one" >&2
+    exit 1
+  fi
+  bad=$(printf '%s\\n' "$deps" | grep -E '^github\\.com/garm-ai/garm(/|$)' || true)
+  if [ -n "$bad" ]; then
+    found=1
+    echo "reachable under: go list -deps $graph" >&2
+    printf '%s\\n' "$bad" | sed 's|^|  |' >&2
+  fi
+done
+if [ "$found" -eq 1 ]; then
+  cat >&2 <<'WHY'
+
+github.com/garm-ai/garm is in artefactd's build graph.
+
+This is not a dependency policy and there is no exception to add. The contracts
+left that module for github.com/garm-ai/contracts in September 2026, and both
+modules still register the same protobuf descriptor file paths. A process that
+links both panics in protoregistry during package init:
+
+  panic: proto: file "garm/tool/v1/attribution.proto" is already registered
+
+So the symptom is a binary that builds, passes every test that does not link
+both, and then dies at startup before main.
+
+To fix it, move the dependency rather than this check:
+
+  * a direct import of github.com/garm-ai/garm/... becomes the matching package
+    under github.com/garm-ai/contracts/...
+  * if it arrived transitively, `go mod why github.com/garm-ai/garm` names the
+    consumer that has not migrated yet
+  * github.com/garm-ai/tool-go before v0.6.0 is still on the old module
+
+WHY
+  exit 1
+fi
+echo "ok: the contracts' old module is in neither build graph"
+"""
+
+[tasks."no-replace"]
+description = "Fail on a replace directive"
+# Every dependency is a real, resolvable version. A replace pointing at a local
+# checkout is invisible to `go install` and to CI from a clean clone.
+run = """
+if grep -Eq '^\\s*replace\\s' go.mod; then
+  echo "go.mod carries a replace directive" >&2
+  exit 1
+fi
+echo "ok: no replace directive"
+"""
+
+[tasks.ci]
+description = "Everything CI runs"
+depends = ["fmt-check", "lint", "build", "test", "tidy-check", "vendor-check", "buf-lint",
+           "proto-lint", "check", "gen-check", "no-enforcement", "no-old-contracts", "no-replace"]

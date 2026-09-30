@@ -1,0 +1,29 @@
+# sqlc, and it is the platform's first use of it — CLAUDE.md records why and
+# what the caveat is.
+#
+# THE SCHEMA IS THE MIGRATIONS, not a separately maintained copy. That is the
+# whole point: sqlc generates against the schema the migrations produce, so a
+# query and a migration that disagree is a BUILD failure rather than a query
+# that fails in front of a person. A second schema file would be a second
+# thing to keep in step, which is the drift this is meant to remove.
+version: "2"
+sql:
+  - engine: postgresql
+    schema: internal/store/migrations
+    queries: internal/store/queries
+    gen:
+      go:
+        package: sqlcgen
+        out: internal/store/sqlcgen
+        sql_package: pgx/v5
+        emit_pointers_for_null_types: true
+        emit_result_struct_pointers: false
+        overrides:
+          # The migration's `text[] NOT NULL` becomes []string rather than a
+          # driver type, so nothing above this package has to know which
+          # driver generated it.
+          - db_type: "text[]"
+            nullable: false
+            go_type:
+              type: "string"
+              slice: true

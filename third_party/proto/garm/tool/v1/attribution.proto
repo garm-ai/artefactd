@@ -1,0 +1,34 @@
+// Attribution: who a call is for and what it belongs to.
+//
+// Shared vocabulary rather than tool-specific. The ledger reads it, the
+// generation plane produces it, and the tool plane carries it across the hop
+// — "reused, never duplicated", as the envelope that carries it puts it.
+//
+// It lives in garm.tool.v1 because the tool plane is the only consumer that
+// has moved out of the monorepo so far, and inventing a third proto package
+// for one message would be paying now for a split nobody needs yet.
+//
+// THE TRIGGER for that split is named rather than left to judgement: the
+// moment a SECOND plane outside this contract needs CallContext — the
+// generation API moving out, or the ledger becoming its own artifact —
+// attribution gets its own package. Until then a move would be churn.
+syntax = "proto3";
+
+package garm.tool.v1;
+
+option go_package = "github.com/garm-ai/contracts/garm/tool/v1;toolv1";
+
+message CallContext {
+  string tenant = 1;
+  string app = 2;
+  string run_id = 3;
+  string correlation_id = 4;
+  string causation_id = 5;
+  string budget_id = 6; // unused in steel thread; reserved for budget plan
+  map<string, string> tags = 7;
+
+  // Static policy/attribution bucket between app and prompt (spec §4):
+  // a product capability, a LangGraph graph, a MAF agent. Optional;
+  // empty resolves against the manifest's app-level defaults.
+  string feature = 8;
+}

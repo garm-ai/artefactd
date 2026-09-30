@@ -1,0 +1,60 @@
+// What garm asserts to a tool for one invocation (tool-service-shell spec §4).
+syntax = "proto3";
+
+package garm.tool.v1;
+
+// PrincipalKind is declared once, in policy.proto. Same proto package, but
+// protoc still resolves cross-FILE references through an explicit import.
+// Same package, but proto still needs the file: types are visible across
+// files only where the file is imported.
+import "garm/tool/v1/attribution.proto";
+import "garm/tool/v1/tool.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/garm-ai/contracts/garm/tool/v1;toolv1";
+
+// InvocationPrincipal is who the call is for. Named to avoid colliding with
+// toolplane.Principal, which carries the policy inputs this deliberately
+// does not.
+message InvocationPrincipal {
+  string subject = 1;
+  PrincipalKind kind = 2;
+}
+
+// Act is one hop of a delegation chain (tools-server-design §6.2).
+message Act {
+  string subject = 1;
+  PrincipalKind kind = 2;
+}
+
+// InvocationContext is what crosses the NATS hop beside the request.
+//
+// It carries ASSERTIONS, never credentials: forwarding the caller's token
+// would hand every tool a replayable bearer credential and undo the §6.2
+// intersection property that makes delegation safe.
+//
+// It deliberately does NOT carry clearance or compartments. The tool returns
+// the full message and garm redacts; a tool that can see clearance is a tool
+// that will eventually filter, which is a second unreviewed copy of the
+// policy (spec §4.4).
+message InvocationContext {
+  // Attribution the ledger already understands. Reused, never duplicated.
+  CallContext attribution = 1;
+
+  InvocationPrincipal principal = 2;
+  repeated Act act = 3;
+
+  // Delegation only: for attenuating a DOWNSTREAM call made on the caller's
+  // behalf. Never an access decision (spec §4.4).
+  repeated string scopes = 4;
+
+  string traceparent = 5;
+  string tracestate = 6;
+
+  // Absolute, not a duration: a relative deadline restarts on every hop.
+  google.protobuf.Timestamp deadline = 7;
+
+  string call_id = 8;
+  string idempotency_key = 9;
+  string contract_version = 10;
+}
