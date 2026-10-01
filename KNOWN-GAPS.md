@@ -86,9 +86,29 @@ outliving a request, and it collapses the presigned read path. Nothing in this
 repository touches that repository, and `mise run no-enforcement` asserts there
 is not even a path in the dependency graph.
 
-**Not in any compose file.** This service is not added to the development plane.
-It has been run against the plane's SeaweedFS from a test, in its own bucket,
-which is what the round trip covers.
+**In the development plane, and reachable for reads only.** `garm-ai/stack`
+runs this service against the plane's SeaweedFS in its own bucket, and `describe`
+and `read_url` both answer there — `read_url` with `reason=delegated_reader` for
+an agent acting for a person. The WRITE path is a different matter: `begin_write`
+and `commit` require `VERB_WRITE` with the `artefacts` tool set, and no role that
+plane defines combines them, so the plane cannot yet put an object in the store.
+`TestTheWholeRoundTripAgainstARealObjectStore` is what covers the round trip and,
+for now, the only thing that does.
+
+**It does not close by granting a role, and that is a ruling rather than an
+oversight.** Artefacts are written by tools and by people starting processes;
+nobody operates this store directly. So a write is checked against the SERVICE's
+authority and not against whoever the service is serving — the alternative makes
+a write verb on storage a prerequisite for every person who can trigger a
+document-producing tool. Reading keeps the fold, because there the question
+genuinely is what THIS viewer may see: authority to write is the service's,
+authority to read is the viewer's, and a document someone caused to exist is not
+therefore a document they may read. Nothing issues a service token yet, which is
+the actual reason this is shut. See
+`spec/docs/superpowers/decisions/2026-09-30-a-service-calls-on-its-own-behalf.md`
+for the build order — a client-credentials grant in the IdP, a `services:` block
+in the claims policy, `kind=SERVICE` as a first-class caller in garmd, and only
+then this path.
 
 ## Where a check is thinner than the design
 

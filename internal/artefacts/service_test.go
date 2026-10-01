@@ -301,7 +301,19 @@ func TestEveryMintIsRecordedWithWhoGotItAndWhen(t *testing.T) {
 	if got.CallID == "" {
 		t.Error("the row records no call id, so it cannot be joined to the ledger")
 	}
-	if !got.URLExpiresAt.Equal(released.ExpiresAt.UTC()) {
+	// Compared at the resolution the COLUMN has, not the one Go hands out.
+	// Postgres `timestamptz` keeps microseconds, so the expiry comes back
+	// truncated while the one the mint returned still carries whatever
+	// precision time.Now() gave it. Asserting the two instants are exactly
+	// equal asserts a precision the store never promised.
+	//
+	// THIS IS WHY IT WAS GREEN ON A LAPTOP AND RED IN CI, which is the part
+	// worth remembering: time.Now() is microsecond-granular on darwin and
+	// nanosecond-granular on linux. The exact comparison therefore passed every
+	// time on macOS — there was no remainder to lose — and failed on CI's
+	// ubuntu runner on any mint whose nanosecond remainder was non-zero.
+	const stored = time.Microsecond
+	if !got.URLExpiresAt.Truncate(stored).Equal(released.ExpiresAt.UTC().Truncate(stored)) {
 		t.Errorf("the row says the URL dies at %s and the URL dies at %s",
 			got.URLExpiresAt, released.ExpiresAt)
 	}
