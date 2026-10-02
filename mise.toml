@@ -13,7 +13,10 @@ sqlc = "1"
 description = "Install the garm CLI at the pinned version"
 # Pinned, not @latest: the catalogue digest must not move because someone
 # upgraded a CLI on a laptop.
-run = "go install github.com/garm-ai/garm/cmd/garm@v0.19.0"
+#
+# Raised from v0.19.0 to v0.27.0 to compose from catalogue.yaml instead of
+# the now-deleted `--proto`, which v0.19.0 never understood.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.27.0"
 
 [tasks.plugin]
 description = "Install the tool generator at the pinned version"
@@ -21,7 +24,7 @@ description = "Install the tool generator at the pinned version"
 # you changes committed output for no reason anyone asked for. It must be the
 # same release as the CLI: one writes the catalogue, the other writes the
 # binding whose hash the catalogue is checked against.
-run = "go install github.com/garm-ai/garm/cmd/protoc-gen-garm-go@v0.19.0"
+run = "go install github.com/garm-ai/garm/cmd/protoc-gen-garm-go@v0.27.0"
 
 [tasks.daemon]
 description = "Install garmd at the pinned version, for the mount check"
@@ -172,27 +175,18 @@ echo "ok: the vendored annotations match contracts $V"
 """
 
 [tasks."proto-lint"]
-description = "garm lint over the contract, with the vendored annotations joined in"
-# garm lint takes ONE proto root and resolves imports from it, so the two trees
-# are joined the way a catalogue build sees them.
-depends = ["cli", "assemble"]
-run = "garm lint --proto build/proto"
-
-[tasks.assemble]
-description = "Copy the contract and the vendored annotations into build/proto"
-run = """
-set -e
-rm -rf build/proto && mkdir -p build/proto
-cp -R third_party/proto/. build/proto/
-cp -R proto/. build/proto/
-echo "assembled build/proto:"
-find build/proto -type f | sort
-"""
+description = "garm lint over catalogue.yaml"
+# No `assemble` and no `build/proto`: `garm lint` resolves garm/tool/v1,
+# garm/card/v1 and garm/meta/v1 from the descriptors this binary links before
+# it looks at third_party/proto on disk, the same way `garm catalogue build`
+# always has. catalogue.yaml's own comment has the byte-for-byte proof.
+depends = ["cli"]
+run = "garm lint"
 
 [tasks.catalogue]
-description = "Build the artefacts catalogue from the assembled tree"
-depends = ["cli", "assemble"]
-run = "garm catalogue build --proto build/proto -o build/artefacts.binpb --source garm-ai/artefactd"
+description = "Build the artefacts catalogue from catalogue.yaml"
+depends = ["cli"]
+run = "garm catalogue build -o build/artefacts.binpb --source garm-ai/artefactd"
 
 [tasks.check]
 description = "Assert the catalogue mounts on a daemon"

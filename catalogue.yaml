@@ -1,0 +1,24 @@
+# catalogue.yaml — what composes into this deployment's catalogue.
+#
+# One input: this repository's own declarations. The vendored platform
+# annotations under third_party/proto (garm/tool/v1, garm/card/v1,
+# garm/meta/v1) need no entry of their own — `garm catalogue build` resolves
+# those imports from the descriptors THIS BINARY links before it looks on
+# disk, the same way it always has, so there is nothing for a manifest to
+# name there.
+#
+# This replaces `assemble`, which used to copy third_party/proto and proto/
+# into one build/proto root because `--proto` took a single directory.
+# Confirmed byte-for-byte: the descriptor hash `garm catalogue build` stamps
+# for garm.artefacts.v1 and the tool list it prints are identical whether
+# built from the old assembled build/proto or from `path: proto` alone — the
+# extra files build/proto used to pull in (garm/tool/v1/errors.proto,
+# attribution.proto, invocation.proto) were never actually imported by
+# anything in this tree; they just rode along because the old tree compiled
+# every .proto file sitting under the assembled root rather than only the
+# ones actually reached by import.
+schema: v1
+name: artefactd
+
+include:
+  - path: proto
