@@ -15,8 +15,11 @@ description = "Install the garm CLI at the pinned version"
 # upgraded a CLI on a laptop.
 #
 # Raised from v0.19.0 to v0.27.0 to compose from catalogue.yaml instead of
-# the now-deleted `--proto`, which v0.19.0 never understood.
-run = "go install github.com/garm-ai/garm/cmd/garm@v0.27.0"
+# the now-deleted `--proto`, which v0.19.0 never understood. Raised again to
+# v0.29.0, the release that deletes --proto outright, rather than leaving
+# this pin stranded at the newest tag that happened to be published when the
+# migration landed.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.29.0"
 
 [tasks.plugin]
 description = "Install the tool generator at the pinned version"
@@ -24,7 +27,7 @@ description = "Install the tool generator at the pinned version"
 # you changes committed output for no reason anyone asked for. It must be the
 # same release as the CLI: one writes the catalogue, the other writes the
 # binding whose hash the catalogue is checked against.
-run = "go install github.com/garm-ai/garm/cmd/protoc-gen-garm-go@v0.27.0"
+run = "go install github.com/garm-ai/garm/cmd/protoc-gen-garm-go@v0.29.0"
 
 [tasks.daemon]
 description = "Install garmd at the pinned version, for the mount check"
